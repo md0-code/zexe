@@ -1,0 +1,29 @@
+[package]
+name = "zexe-runner"
+version = "0.1.0"
+edition = "2024"
+description = "A lightweight ZX Spectrum emulator designed as a standalone game runner."
+license = "GPL-3.0-only"
+repository = "https://github.com/user/zexe"
+
+[dependencies]
+anyhow = "1.0.100"
+byteorder = "1.5.0"
+rustzx-core = { version = "0.16.0", features = ["embedded-roms", "precise-border", "sound", "ay"] }
+winit = "0.30.12"
+cpal = "0.15.3"
+ringbuf = "0.3.3"
+glow = "0.13.1"
+glutin = "0.32.1"
+glutin-winit = "0.5.0"
+raw-window-handle = "0.6.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+flate2 = "1.0.35"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

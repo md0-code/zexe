@@ -1,0 +1,21 @@
+[package]
+name = "zexe-bundler"
+version = "0.1.0"
+edition = "2024"
+description = "A utility to bundle ZX Spectrum snapshots into standalone executables."
+license = "GPL-3.0-only"
+repository = "https://github.com/user/zexe"
+
+[dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.54", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+flate2 = "1.0.35"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

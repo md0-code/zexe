@@ -1,10 +1,10 @@
 [package]
 name = "zexe-runner"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 description = "A lightweight ZX Spectrum emulator designed as a standalone game runner."
 license = "GPL-3.0-only"
-repository = "https://github.com/user/zexe"
+repository = "https://github.com/md0-code/zexe"
 
 [dependencies]
 anyhow = "1.0.100"
@@ -20,10 +20,3 @@ raw-window-handle = "0.6.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 flate2 = "1.0.35"
-
-[profile.release]
-opt-level = "z"
-lto = true
-codegen-units = 1
-panic = "abort"
-strip = true

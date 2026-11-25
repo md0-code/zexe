@@ -28,38 +28,7 @@ The project consists of two main tools:
 - A C compiler (for some dependencies)
 - Development headers for OpenGL and ALSA (on Linux)
 
-### Windows
-
-You can use the provided batch script to build both components and package them into the `dist` folder:
-
-```batch
-build_dist.bat
-```
-
-Or manually:
-```powershell
-cd zexe-runner
-cargo build --release
-cd ../zexe-bundler
-cargo build --release
-```
-
-### Linux
-
-You can use the provided shell script:
-
-```bash
-chmod +x build_dist.sh
-./build_dist.sh
-```
-
-Or manually:
-```bash
-cd zexe-runner && cargo build --release
-cd ../zexe-bundler && cargo build --release
-```
-
-*Note: The Linux script will attempt to use `upx` to compress the resulting binaries if it is installed.*
+Run `python tools/package.py` from a clean checkout with Python 3 and Cargo. The unpacked programs appear in `dist/` and the native archive in `dist/releases/`. To compile without packaging, run `cargo build --release --locked`.
 
 ## Usage Guide
 

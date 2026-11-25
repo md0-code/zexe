@@ -8,3 +8,13 @@
 # IDE/Local
 .vscode/
 *.user
+
+/build/
+/work/
+/AGENTS.md
+/ISSUES.md
+/TODO.md
+/PLAN.md
+/docs/DEVELOPMENT.md
+/docs/dev/
+__pycache__/

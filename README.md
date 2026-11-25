@@ -11,9 +11,9 @@ The project consists of two main tools:
 
 ## Features
 
-- **Portable**: Generates a single file with no external dependencies required.
+- **Portable**: Bundles the emulator and snapshot in one executable. The runner uses the host graphics and audio drivers.
 - **Multi-Platform**: Native support for both Windows and Linux.
-- **Snapshot Format Support**: Handles `.sna`, `.z80`, and `.szx` snapshot formats.
+- **Snapshot Format Support**: Loads SNA files and converts 48K/128K Z80 and SZX CPU and RAM state. Peripheral-specific state such as AY registers is outside this conversion.
 - **Spectrum 48K/128K Support**: Automatic selection of 48K or 128K modes based on the input snapshot.
 - **High-Quality Rendering**: Uses OpenGL (via `glow`) for smooth scaling, with support for built-in filtering (Nearest, Linear, Scanlines).
 - **RetroArch Shader Support**: Support for external and embedded RetroArch-compatible `.glsl` shaders for advanced post-processing.
@@ -57,7 +57,7 @@ If you want to specify a different output name:
 ```
 
 **Customizing the Runner:**
-By default, the bundler looks for `zexe-runner` (or `zexe-runner.exe`) in the current working directory. If it is located elsewhere, use the `--runner` flag:
+By default, the bundler looks for `zexe-runner` (or `zexe-runner.exe`) beside the bundler, then in the current working directory. If it is located elsewhere, use the `--runner` flag:
 ```bash
 ./zexe-bundler game.z80 --runner ./path/to/zexe-runner
 ```
@@ -90,6 +90,8 @@ When a joystick mode is active (**F3**), the **Arrow Keys** and **Alt Left** are
 
 *Note: You can still use the standard numeric keys (1-0) for Sinclair joysticks if you prefer, as they are part of the standard keyboard mapping.*
 
+See [the build notes](docs/NOTES.md) and [release history](docs/CHANGELOG.md).
+
 ## Advanced Features
 
 ### Custom Shaders
@@ -101,7 +103,7 @@ Zexe supports custom OpenGL shaders for post-processing. To ensure compatibility
   3. A file named `shader.glsl` in the same directory as the executable.
 
 ### Cheats (POKEs)
-You can include POKEs to cheat in games.
+You can include fixed-value trainer entries that use the current address space (bank 8). The core skips physical-bank entries and values that need interactive input.
 - **Internal**: Use the `--pokes` flag with `zexe-bundler` to embed a `.pok` file.
 - **External/Fallback**: The runner will look for a `.pok` file with the same name as your executable (e.g., `my_game.pok`) in the same directory.
 
@@ -118,4 +120,4 @@ A `config.json` can be embedded using the `--config` flag or placed in the same 
 
 ## License
 
-This project is licensed under the GPLv3 License - see the LICENSE file for details.
+This project is licensed under the GPLv3 License - see [the license](docs/LICENSE) and [third-party notices](docs/THIRD_PARTY.md).

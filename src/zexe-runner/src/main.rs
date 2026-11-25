@@ -13,7 +13,7 @@ use std::env;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use flate2::read::ZlibDecoder;
-use std::mem;
+use std::path::PathBuf;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -111,12 +111,17 @@ struct PokeEntry {
     addr: u16,
     value: u8,
     original: u8,
+    saved: u8,
 }
 
 fn parse_pokes_content(content: &str) -> Vec<PokeEntry> {
     let mut pokes = Vec::new();
     for line in content.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 5 && (parts[0] == "M" || parts[0] == "Z") && parts[1] != "8" {
+            eprintln!("Skipping physical-bank POKE (bank {}): {line}", parts[1]);
+            continue;
+        }
         if parts.len() >= 5 && (parts[0] == "M" || parts[0] == "Z")
             && let (Ok(addr), Ok(val), Ok(org)) = (
                 parts[2].parse::<u16>(),
@@ -124,7 +129,7 @@ fn parse_pokes_content(content: &str) -> Vec<PokeEntry> {
                 parts[4].parse::<u8>()
             ) 
         {
-            pokes.push(PokeEntry { addr, value: val, original: org });
+            pokes.push(PokeEntry { addr, value: val, original: org, saved: org });
         }
     }
     pokes
@@ -262,16 +267,6 @@ void main() {
     }
 }"#;
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct Footer {
-    magic: [u8; 4],
-    snapshot_size: u32,
-    shader_size: u32,
-    pokes_size: u32,
-    config_size: u32,
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Config {
     #[serde(default = "default_fullscreen")]
@@ -306,11 +301,15 @@ impl Default for Config {
     }
 }
 
-fn decompress_data(data: &[u8]) -> Result<Vec<u8>> {
-    let mut decoder = ZlibDecoder::new(data);
-    let mut decompressed = Vec::new();
-    decoder.read_to_end(&mut decompressed)?;
-    Ok(decompressed)
+fn bundle_section(file: &mut File, size: u32) -> Result<Vec<u8>> {
+    let mut input = file.take(u64::from(size));
+    let mut data = Vec::new();
+    if size != 0 {
+        ZlibDecoder::new(&mut input).read_to_end(&mut data)?;
+        std::io::copy(&mut input, &mut std::io::sink())?;
+        anyhow::ensure!(input.limit() == 0, "Incomplete bundle section");
+    }
+    Ok(data)
 }
 
 fn main() -> Result<()> {
@@ -325,71 +324,49 @@ fn main() -> Result<()> {
     let exe_path = env::current_exe().context("Failed to get current exe path")?;
     
     let mut file = File::open(&exe_path).context("Failed to open executable")?;
-    let footer_size = mem::size_of::<Footer>() as i64;
     let file_len = file.metadata()?.len();
-    
     let mut snapshot_data = Vec::new();
     let mut embedded_shader = None;
     let mut embedded_pokes = None;
     let mut embedded_config = None;
-
-    if file_len >= footer_size as u64 {
-        file.seek(SeekFrom::End(-footer_size))?;
-        let mut footer_buf = [0u8; std::mem::size_of::<Footer>()];
-        file.read_exact(&mut footer_buf)?;
-        let footer: Footer = unsafe { mem::transmute(footer_buf) };
-
-        if &footer.magic == FOOTER_MAGIC {
-            // Read and Decompress Snapshot
-            let snapshot_offset = file_len - (footer_size as u64) - (footer.config_size as u64) - (footer.pokes_size as u64) - (footer.shader_size as u64) - (footer.snapshot_size as u64);
-            file.seek(SeekFrom::Start(snapshot_offset))?;
-            let mut comp_snap_data = vec![0u8; footer.snapshot_size as usize];
-            file.read_exact(&mut comp_snap_data)?;
-            snapshot_data = decompress_data(&comp_snap_data).unwrap_or_default();
-
-            // Read and Decompress Shader
-            if footer.shader_size > 0 {
-                let shader_offset = file_len - (footer_size as u64) - (footer.config_size as u64) - (footer.pokes_size as u64) - (footer.shader_size as u64);
-                file.seek(SeekFrom::Start(shader_offset))?;
-                let mut comp_shader_data = vec![0u8; footer.shader_size as usize];
-                file.read_exact(&mut comp_shader_data)?;
-                if let Ok(decomp) = decompress_data(&comp_shader_data)
-                    && let Ok(s) = String::from_utf8(decomp) {
-                        embedded_shader = Some(s);
-                }
+    if file_len >= 20 {
+        file.seek(SeekFrom::End(-20))?;
+        let mut footer = [0u8; 20];
+        file.read_exact(&mut footer)?;
+        if &footer[..4] == FOOTER_MAGIC {
+            let mut sizes = [0u32; 4];
+            for (size, bytes) in sizes.iter_mut().zip(footer[4..].chunks_exact(4)) {
+                *size = u32::from_le_bytes(bytes.try_into()?);
             }
-
-            // Read and Decompress Pokes
-            if footer.pokes_size > 0 {
-                let pokes_offset = file_len - (footer_size as u64) - (footer.config_size as u64) - (footer.pokes_size as u64);
-                file.seek(SeekFrom::Start(pokes_offset))?;
-                let mut comp_pokes_data = vec![0u8; footer.pokes_size as usize];
-                file.read_exact(&mut comp_pokes_data)?;
-                if let Ok(decomp) = decompress_data(&comp_pokes_data)
-                    && let Ok(s) = String::from_utf8(decomp) {
-                        embedded_pokes = Some(s);
+            let total: u64 = sizes.iter().map(|&n| u64::from(n)).sum();
+            file.seek(SeekFrom::Start((file_len - 20).checked_sub(total).context("Invalid bundle lengths")?))?;
+            snapshot_data = bundle_section(&mut file, sizes[0]).context("Reading embedded snapshot")?;
+            anyhow::ensure!(!snapshot_data.is_empty(), "The embedded snapshot is empty");
+            if sizes[1] != 0 { embedded_shader = Some(String::from_utf8(bundle_section(&mut file, sizes[1])?)?); }
+            if sizes[2] != 0 { embedded_pokes = Some(String::from_utf8(bundle_section(&mut file, sizes[2])?)?); }
+            if sizes[3] != 0 { embedded_config = Some(serde_json::from_slice(&bundle_section(&mut file, sizes[3])?)?); }
+        }
+    }
+    let mut config_path = None;
+    if embedded_config.is_none() {
+        for path in [exe_path.with_extension("json"), exe_path.with_file_name("config.json")] {
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    embedded_config = Some(serde_json::from_slice(&bytes).with_context(|| format!("Reading {path:?}"))?);
+                    config_path = Some(path);
+                    break;
                 }
-            }
-
-            // Read and Decompress Config
-            if footer.config_size > 0 {
-                let config_offset = file_len - (footer_size as u64) - (footer.config_size as u64);
-                file.seek(SeekFrom::Start(config_offset))?;
-                let mut comp_config_data = vec![0u8; footer.config_size as usize];
-                file.read_exact(&mut comp_config_data)?;
-                if let Ok(decomp) = decompress_data(&comp_config_data)
-                    && let Ok(c) = serde_json::from_slice::<Config>(&decomp) {
-                        embedded_config = Some(c);
-                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err.into()),
             }
         }
     }
 
-    run_emulator(&snapshot_data, embedded_shader, embedded_pokes, embedded_config, sound_latency)
+    run_emulator(&snapshot_data, embedded_shader, embedded_pokes, embedded_config, config_path, sound_latency)
 }
 
-fn run_emulator(snapshot_data: &[u8], embedded_shader: Option<String>, embedded_pokes: Option<String>, embedded_config: Option<Config>, sound_latency: u32) -> Result<()> {
-    let mut app = App::new(snapshot_data, embedded_shader, embedded_pokes, embedded_config, sound_latency)?;
+fn run_emulator(snapshot_data: &[u8], embedded_shader: Option<String>, embedded_pokes: Option<String>, embedded_config: Option<Config>, config_path: Option<PathBuf>, sound_latency: u32) -> Result<()> {
+    let mut app = App::new(snapshot_data, embedded_shader, embedded_pokes, embedded_config, config_path, sound_latency)?;
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
     event_loop.run_app(&mut app)?;
@@ -433,12 +410,38 @@ struct App {
     last_frame_time: Instant,
     target_frame_duration: Duration,
     is_full_speed: bool,
+    config_path: Option<PathBuf>,
     current_volume: u8,
     is_muted: bool,
 }
 
+fn output_stream<T: cpal::SizedSample + cpal::FromSample<f32>>(
+    device: &cpal::Device, config: &cpal::StreamConfig, mut consumer: ringbuf::HeapConsumer<f32>,
+) -> Result<cpal::Stream> {
+    Ok(device.build_output_stream(config, move |buffer: &mut [T], _| {
+        for sample in buffer {
+            *sample = T::from_sample(consumer.pop().unwrap_or(0.0).clamp(-1.0, 1.0));
+        }
+    }, |err| eprintln!("Audio stream error: {err}"), None)?)
+}
+
+fn decode_snapshot(snapshot_data: &[u8]) -> Result<(Vec<u8>, ZXMachine)> {
+    Ok(if snapshot_data.starts_with(b"ZXST") {
+        szx_loader::convert_szx_to_sna(snapshot_data).context("Loading SZX snapshot")?
+    } else if snapshot_data.is_empty() || snapshot_data.len() == 49179 {
+        (snapshot_data.to_vec(), ZXMachine::Sinclair48K)
+    } else if matches!(snapshot_data.len(), 131103 | 147487)
+        && snapshot_data[25] <= 2 && snapshot_data[26] <= 7
+        && (snapshot_data.len() == 147487) == matches!(snapshot_data[49181] & 7, 2 | 5) {
+        (snapshot_data.to_vec(), ZXMachine::Sinclair128K)
+    } else {
+        z80_loader::convert_z80_to_sna(snapshot_data).context("Loading Z80 snapshot")?
+    })
+}
+
 impl App {
-    fn new(snapshot_data: &[u8], embedded_shader: Option<String>, embedded_pokes: Option<String>, embedded_config: Option<Config>, sound_latency: u32) -> Result<Self> {
+    fn new(snapshot_data: &[u8], embedded_shader: Option<String>, embedded_pokes: Option<String>, embedded_config: Option<Config>, config_path: Option<PathBuf>, sound_latency: u32) -> Result<Self> {
+        let (loaded_data, machine) = decode_snapshot(snapshot_data)?;
         // Audio Setup
         let audio_host = cpal::default_host();
         let audio_device = audio_host.default_output_device().context("No audio device")?;
@@ -447,48 +450,27 @@ impl App {
         let channels = config.channels();
         
         let rb = HeapRb::<f32>::new(sample_rate as usize * channels as usize); // 1.0s buffer for RDP
-        let (producer, mut consumer) = rb.split();
-
-        let mut last_sample = 0.0;
-        let mut stream_config: cpal::StreamConfig = config.into();
-        // Set hardware buffer size based on requested latency
-        let buffer_frames = (sample_rate as f32 * (sound_latency as f32 / 1000.0)) as u32;
-        stream_config.buffer_size = cpal::BufferSize::Fixed(buffer_frames.max(512));
-
-        let audio_stream = audio_device.build_output_stream(
-            &stream_config,
-            move |data: &mut [f32], _| {
-                for sample in data.iter_mut() {
-                    if let Some(s) = consumer.pop() {
-                        last_sample = s;
-                        *sample = s;
-                    } else {
-                        *sample = last_sample;
-                    }
-                }
-            },
-            |err| eprintln!("Audio stream error: {:?}", err),
-            None
-        )?;
+        let (producer, consumer) = rb.split();
+        let mut stream_config = config.config();
+        if let cpal::SupportedBufferSize::Range { min, max } = config.buffer_size() {
+            let frames = (sample_rate as u64 * u64::from(sound_latency) / 1000) as u32;
+            stream_config.buffer_size = cpal::BufferSize::Fixed(frames.clamp(*min, *max));
+        }
+        let audio_stream = match config.sample_format() {
+            cpal::SampleFormat::I8 => output_stream::<i8>(&audio_device, &stream_config, consumer),
+            cpal::SampleFormat::I16 => output_stream::<i16>(&audio_device, &stream_config, consumer),
+            cpal::SampleFormat::I32 => output_stream::<i32>(&audio_device, &stream_config, consumer),
+            cpal::SampleFormat::I64 => output_stream::<i64>(&audio_device, &stream_config, consumer),
+            cpal::SampleFormat::U8 => output_stream::<u8>(&audio_device, &stream_config, consumer),
+            cpal::SampleFormat::U16 => output_stream::<u16>(&audio_device, &stream_config, consumer),
+            cpal::SampleFormat::U32 => output_stream::<u32>(&audio_device, &stream_config, consumer),
+            cpal::SampleFormat::U64 => output_stream::<u64>(&audio_device, &stream_config, consumer),
+            cpal::SampleFormat::F32 => output_stream::<f32>(&audio_device, &stream_config, consumer),
+            cpal::SampleFormat::F64 => output_stream::<f64>(&audio_device, &stream_config, consumer),
+            other => anyhow::bail!("Unsupported audio format: {other:?}"),
+        }?;
 
         let config_volume = embedded_config.as_ref().map(|c| c.volume).unwrap_or(100);
-        let mut machine = ZXMachine::Sinclair48K;
-        let mut loaded_data = snapshot_data.to_vec();
-
-        if !snapshot_data.is_empty() {
-            if snapshot_data.len() == 49179 {
-                // Sna 48K
-            } else if snapshot_data.starts_with(b"ZXST") {
-                if let Ok((data, m)) = szx_loader::convert_szx_to_sna(snapshot_data) {
-                    loaded_data = data;
-                    machine = m;
-                }
-            } else if let Ok((data, m)) = z80_loader::convert_z80_to_sna(snapshot_data) {
-                loaded_data = data;
-                machine = m;
-            }
-        }
-
         let settings = RustzxSettings {
             machine,
             emulation_mode: EmulationMode::FrameCount(1),
@@ -510,7 +492,7 @@ impl App {
         if !snapshot_data.is_empty() {
             let cursor = BufferCursor::new(loaded_data);
             let snapshot = Snapshot::Sna(cursor);
-            let _ = emulator.load_snapshot(snapshot);
+            emulator.load_snapshot(snapshot).map_err(|err| anyhow::anyhow!("Loading snapshot: {err:?}"))?;
         }
 
         let retro_shader = load_retro_shader();
@@ -555,7 +537,8 @@ impl App {
             last_frame_time: Instant::now(),
             target_frame_duration: Duration::from_micros(20000),
             is_full_speed: false,
-            current_volume: config_volume,
+            config_path,
+            current_volume: config_volume.min(200),
             is_muted: false,
         };
 
@@ -570,12 +553,8 @@ impl App {
         app._audio_stream.play()?;
 
         // Apply pokes if enabled on startup
-        if app.pokes_enabled && !app.pokes.is_empty() {
-            let mut actions = Vec::new();
-            for p in &app.pokes {
-                actions.push(PokeAction::mem(p.addr, p.value));
-            }
-            app.emulator.execute_poke(ManualPoke { actions });
+        if app.pokes_enabled {
+            app.apply_pokes(true);
         }
 
         // Apply dynamic config
@@ -647,10 +626,19 @@ impl App {
         }
     }
 
+    fn apply_pokes(&mut self, enabled: bool) {
+        let mut actions = Vec::new();
+        for poke in &mut self.pokes {
+            if enabled {
+                poke.saved = if poke.original == 0 { self.emulator.peek(poke.addr) } else { poke.original };
+            }
+            actions.push(PokeAction::mem(poke.addr, if enabled { poke.value } else { poke.saved }));
+        }
+        self.emulator.execute_poke(ManualPoke { actions });
+    }
+
     fn save_volume_to_config(&self) {
-        // Try to update config.json in the parent dir
-        let config_path = std::env::current_dir().map(|mut p| { p.push("config.json"); p }).ok();
-        if let Some(path) = config_path
+        if let Some(path) = &self.config_path
             && let Ok(config) = std::fs::read_to_string(&path).and_then(|s| serde_json::from_str::<serde_json::Value>(&s).map_err(std::io::Error::other)) {
                 let mut config = config;
                 config["volume"] = serde_json::Value::from(self.get_volume());
@@ -1142,20 +1130,8 @@ impl ApplicationHandler for App {
                                     self.set_osd("NO POKES FOUND");
                                 } else {
                                     self.pokes_enabled = !self.pokes_enabled;
-                                    let mut actions = Vec::new();
-                                    if self.pokes_enabled {
-                                        for p in &self.pokes {
-                                            actions.push(PokeAction::mem(p.addr, p.value));
-                                        }
-                                        self.set_osd("POKES: ON");
-                                    } else {
-                                        for p in &self.pokes {
-                                            actions.push(PokeAction::mem(p.addr, p.original));
-                                        }
-                                        self.set_osd("POKES: OFF");
-                                    }
-                                    let p = ManualPoke { actions };
-                                    self.emulator.execute_poke(p);
+                                    self.apply_pokes(self.pokes_enabled);
+                                    self.set_osd(if self.pokes_enabled { "POKES: ON" } else { "POKES: OFF" });
                                 }
                             }
                         } else if pressed && code == KeyCode::F1 {

@@ -1,9 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use serde::{Serialize, Deserialize};
 use std::fs::File;
 use std::io::{Read, Write};
-use std::mem;
 use std::path::{PathBuf, Path};
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
@@ -11,77 +9,6 @@ use flate2::write::ZlibEncoder;
 use std::os::unix::fs::PermissionsExt;
 
 const FOOTER_MAGIC: &[u8; 4] = b"ZXND";
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct Footer {
-    magic: [u8; 4],
-    snapshot_size: u32,
-    shader_size: u32,
-    pokes_size: u32,
-    config_size: u32,
-}
-
-impl Footer {
-    fn new(snapshot_size: u32, shader_size: u32, pokes_size: u32, config_size: u32) -> Self {
-        Self {
-            magic: *FOOTER_MAGIC,
-            snapshot_size,
-            shader_size,
-            pokes_size,
-            config_size,
-        }
-    }
-    
-    fn as_bytes(&self) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                (self as *const Footer) as *const u8,
-                mem::size_of::<Footer>(),
-            )
-        }
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct Config {
-    #[serde(default = "default_fullscreen")]
-    fullscreen: bool,
-    filtering: Option<String>,
-    #[serde(default = "default_joystick")]
-    joystick: String,
-    #[serde(default = "default_border")]
-    border: String,
-    #[serde(default = "default_cheats")]
-    cheats_enabled: bool,
-    #[serde(default = "default_volume")]
-    volume: u8,
-}
-
-#[allow(dead_code)]
-fn default_fullscreen() -> bool { true }
-#[allow(dead_code)]
-fn default_joystick() -> String { "Off".to_string() }
-#[allow(dead_code)]
-fn default_border() -> String { "Full".to_string() }
-#[allow(dead_code)]
-fn default_cheats() -> bool { false }
-#[allow(dead_code)]
-fn default_volume() -> u8 { 100 }
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            fullscreen: true,
-            filtering: None,
-            joystick: "Off".to_string(),
-            border: "Full".to_string(),
-            cheats_enabled: false,
-            volume: 100,
-        }
-    }
-}
 
 fn compress_data(data: &[u8]) -> Result<Vec<u8>> {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
@@ -92,7 +19,7 @@ fn compress_data(data: &[u8]) -> Result<Vec<u8>> {
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// Input Z80 snapshot file
+    /// Input Spectrum snapshot (.sna, .z80 or .szx)
     input: PathBuf,
 
     /// Output EXE file (Optional, defaults to input name)
@@ -100,8 +27,8 @@ struct Args {
     output: Option<PathBuf>,
 
     /// Path to the runner executable template (Optional)
-    #[arg(short, long, default_value = if cfg!(windows) { "zexe-runner.exe" } else { "zexe-runner" })]
-    runner: PathBuf,
+    #[arg(short, long)]
+    runner: Option<PathBuf>,
 
     /// Path to a GLSL shader to embed (Optional) (default search: input_name.glsl, shader.glsl)
     #[arg(short, long)]
@@ -137,10 +64,19 @@ fn main() -> Result<()> {
     let mut input_file = File::open(&args.input).context("Failed to open input snapshot")?;
     let mut snapshot_data = Vec::new();
     input_file.read_to_end(&mut snapshot_data)?;
+    anyhow::ensure!(!snapshot_data.is_empty(), "The snapshot is empty");
     println!("Snapshot size: {} bytes", snapshot_data.len());
 
     // 2. Read Runner
-    let mut runner_file = File::open(&args.runner).context("Failed to open runner executable")?;
+    let runner = match args.runner {
+        Some(path) => path,
+        None => {
+            let name = format!("zexe-runner{}", std::env::consts::EXE_SUFFIX);
+            let sibling = std::env::current_exe()?.with_file_name(&name);
+            if sibling.is_file() { sibling } else { PathBuf::from(name) }
+        }
+    };
+    let mut runner_file = File::open(&runner).context("Failed to open runner executable")?;
     let mut runner_data = Vec::new();
     runner_file.read_to_end(&mut runner_data)?;
     println!("Runner template size: {} bytes", runner_data.len());
@@ -203,6 +139,8 @@ fn main() -> Result<()> {
         println!("Embedding config from {:?}...", path);
         let mut config_file = File::open(path).context("Failed to open config file")?;
         config_file.read_to_end(&mut config_data)?;
+        let value: serde_json::Value = serde_json::from_slice(&config_data).context("Invalid JSON configuration")?;
+        anyhow::ensure!(value.is_object(), "Configuration must be a JSON object");
     }
 
     // 6. Prepare and Compress data
@@ -211,15 +149,19 @@ fn main() -> Result<()> {
     let compressed_pokes = if !pokes_data.is_empty() { Some(compress_data(&pokes_data)?) } else { None };
     let compressed_config = if !config_data.is_empty() { Some(compress_data(&config_data)?) } else { None };
 
-    let footer = Footer::new(
-        compressed_snapshot.len() as u32, 
-        compressed_shader.as_ref().map(|v| v.len()).unwrap_or(0) as u32, 
-        compressed_pokes.as_ref().map(|v| v.len()).unwrap_or(0) as u32,
-        compressed_config.as_ref().map(|v| v.len()).unwrap_or(0) as u32
-    );
-
-    // 7. Write Output
-    let mut output_file = File::create(&output_path).context("Failed to create output file")?;
+    let sizes = [compressed_snapshot.len(), compressed_shader.as_ref().map_or(0, Vec::len),
+        compressed_pokes.as_ref().map_or(0, Vec::len), compressed_config.as_ref().map_or(0, Vec::len)];
+    let mut footer = FOOTER_MAGIC.to_vec();
+    for size in sizes {
+        footer.extend_from_slice(&u32::try_from(size).context("Bundle section exceeds 4 GiB")?.to_le_bytes());
+    }
+    // Write a separate file so failure leaves an existing game intact.
+    let directory = output_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    if let Ok(output) = output_path.canonicalize() {
+        anyhow::ensure!(output != args.input.canonicalize()? && output != runner.canonicalize()?,
+            "Output would replace the snapshot or runner template");
+    }
+    let mut output_file = tempfile::NamedTempFile::new_in(directory)?;
     output_file.write_all(&runner_data)?;
     output_file.write_all(&compressed_snapshot)?;
     if let Some(v) = compressed_shader {
@@ -231,17 +173,19 @@ fn main() -> Result<()> {
     if let Some(v) = compressed_config {
         output_file.write_all(&v)?;
     }
-    output_file.write_all(footer.as_bytes())?;
+    output_file.write_all(&footer)?;
 
     #[cfg(unix)]
     {
-        let mut perms = output_file.metadata()?.permissions();
+        let mut perms = output_file.as_file().metadata()?.permissions();
         perms.set_mode(0o755);
-        output_file.set_permissions(perms)?;
+        output_file.as_file().set_permissions(perms)?;
         println!("Set executable permissions on {:?}", output_path);
     }
 
-    println!("Successfully created {:?} (Total size: {} bytes)", output_path, output_file.metadata()?.len());
+    let size = output_file.as_file().metadata()?.len();
+    output_file.persist(&output_path)?;
+    println!("Successfully created {:?} (Total size: {} bytes)", output_path, size);
 
     Ok(())
 }

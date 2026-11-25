@@ -20,12 +20,13 @@ pub fn convert_szx_to_sna(szx_data: &[u8]) -> Result<(Vec<u8>, ZXMachine)> {
     let _flags = cursor.read_u8()?;
 
     let (machine, is_128k) = match machine_id {
-        1 | 2 => (ZXMachine::Sinclair48K, false),
-        3..=6 => (ZXMachine::Sinclair128K, true),
+        1 => (ZXMachine::Sinclair48K, false),
+        2 | 3 => (ZXMachine::Sinclair128K, true),
         _ => return Err(anyhow!("Unsupported machine ID in SZX: {}", machine_id)),
     };
     
     let mut regs = [0u8; 0x25]; // Z80R data size is usually 0x23 or 0x25
+    let mut have_regs = false;
     let mut ram_pages: std::collections::HashMap<u8, Vec<u8>> = std::collections::HashMap::new();
     let mut border: u8 = 0;
     let mut port_7ffd: u8 = 0;
@@ -33,39 +34,38 @@ pub fn convert_szx_to_sna(szx_data: &[u8]) -> Result<(Vec<u8>, ZXMachine)> {
     let total_len = szx_data.len() as u64;
     while cursor.position() < total_len {
         let mut tag = [0u8; 4];
-        if cursor.read_exact(&mut tag).is_err() { break; }
+        cursor.read_exact(&mut tag)?;
         let size = cursor.read_u32::<LE>()?;
         let pos_before = cursor.position();
         
+        anyhow::ensure!(u64::from(size) <= total_len - pos_before, "Truncated SZX block");
         match &tag {
             b"Z80R" => {
-                let read_size = std::cmp::min(size as usize, regs.len());
+                anyhow::ensure!(size as usize >= regs.len(), "Short SZX register block");
+                have_regs = true;
+                let read_size = regs.len();
                 cursor.read_exact(&mut regs[..read_size])?;
             }
             b"RAMP" => {
+                anyhow::ensure!(size >= 3, "Short SZX RAM block");
                 let flags = cursor.read_u16::<LE>()?;
                 let page_no = cursor.read_u8()?;
-                let data_size = size - 3;
-                let mut compressed_data = vec![0u8; data_size as usize];
-                cursor.read_exact(&mut compressed_data)?;
-                
-                let page_data = if flags & 0x01 != 0 {
-                    let mut decoder = ZlibDecoder::new(&compressed_data[..]);
-                    let mut decompressed = Vec::new();
-                    if decoder.read_to_end(&mut decompressed).is_ok() {
-                        decompressed
-                    } else {
-                        return Err(anyhow!("Failed to decompress RAM page {}", page_no));
-                    }
+                let start = cursor.position() as usize;
+                let end = (pos_before + u64::from(size)) as usize;
+                let bytes = &szx_data[start..end];
+                let page = if flags & 1 != 0 {
+                    let mut decoded = Vec::with_capacity(16384);
+                    ZlibDecoder::new(bytes).take(16385).read_to_end(&mut decoded)?;
+                    decoded
                 } else {
-                    compressed_data
+                    anyhow::ensure!(bytes.len() == 16384, "Wrong SZX RAM page size");
+                    bytes.to_vec()
                 };
-                
-                if page_data.len() == 16384 {
-                    ram_pages.insert(page_no, page_data);
-                }
+                anyhow::ensure!(page.len() == 16384, "Wrong decoded SZX RAM page size");
+                ram_pages.insert(page_no, page);
             }
             b"SPCR" => {
+                anyhow::ensure!(size >= 2, "Short SZX Spectrum register block");
                 border = cursor.read_u8()?;
                 port_7ffd = cursor.read_u8()?;
             }
@@ -77,6 +77,7 @@ pub fn convert_szx_to_sna(szx_data: &[u8]) -> Result<(Vec<u8>, ZXMachine)> {
         cursor.set_position(pos_before + size as u64);
     }
 
+    anyhow::ensure!(have_regs, "Missing SZX register block");
     if !is_128k {
         // SNA Format (48K)
         let mut sna = Vec::with_capacity(27 + 49152);
@@ -125,13 +126,9 @@ pub fn convert_szx_to_sna(szx_data: &[u8]) -> Result<(Vec<u8>, ZXMachine)> {
         sna[23] = (new_sp & 0xFF) as u8;
         sna[24] = (new_sp >> 8) as u8;
 
-        if new_sp >= 16384 {
-            let ram_offset = (new_sp - 16384) as usize;
-            if ram_offset + 1 < ram.len() {
-                ram[ram_offset] = pc_low;
-                ram[ram_offset + 1] = pc_high;
-            }
-        }
+        anyhow::ensure!((0x4000..=0xfffe).contains(&new_sp), "Snapshot stack cannot hold the 48K return address");
+        let offset = usize::from(new_sp - 0x4000);
+        ram[offset..offset + 2].copy_from_slice(&[pc_low, pc_high]);
 
         sna.extend_from_slice(&ram);
 

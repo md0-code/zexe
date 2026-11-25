@@ -25,6 +25,7 @@ pub fn convert_z80_to_sna(z80_data: &[u8]) -> Result<(Vec<u8>, ZXMachine)> {
     let i = cursor.read_u8()?;
     let r = cursor.read_u8()?;
     let byte12 = cursor.read_u8()?;
+    let byte12 = if byte12 == 255 { 1 } else { byte12 };
     let border = (byte12 >> 1) & 0x07;
     // R register handling (bit 7 of R is in byte12)
     let r_full = (r & 0x7F) | ((byte12 & 0x01) << 7);
@@ -52,7 +53,6 @@ pub fn convert_z80_to_sna(z80_data: &[u8]) -> Result<(Vec<u8>, ZXMachine)> {
 
     let mut version = 1;
     let mut pc_real = pc;
-    let mut hardware_mode = 0;
     let mut port_7ffd = 0;
     let mut machine = ZXMachine::Sinclair48K;
     
@@ -67,29 +67,21 @@ pub fn convert_z80_to_sna(z80_data: &[u8]) -> Result<(Vec<u8>, ZXMachine)> {
         let pc_high_ext = cursor.read_u8()?;
         pc_real = u16::from_le_bytes([pc_low_ext, pc_high_ext]);
         
-        if header_len >= 3 {
-            hardware_mode = cursor.read_u8()?;
-            machine = match hardware_mode {
-                0 | 1 => ZXMachine::Sinclair48K,
-                3..=13 => ZXMachine::Sinclair128K,
-                _ => ZXMachine::Sinclair48K,
-            };
-        }
-        if header_len >= 4 {
-            port_7ffd = cursor.read_u8()?;
-        }
-
-        // Skip rest of header
-        let consumed = if header_len >= 4 { 4 } else if header_len >= 3 { 3 } else if header_len >= 2 { 2 } else { 0 };
-        let skip = (header_len as usize).saturating_sub(consumed);
-
-        // Valid header lens: 23 (v2), 54/55 (v3)
-        if header_len == 23 { version = 2; } 
-        else if header_len == 54 || header_len == 55 { version = 3; }
-        
-        for _ in 0..skip {
-            cursor.read_u8()?;
-        }
+        version = match header_len {
+            23 => 2,
+            54 | 55 => 3,
+            _ => return Err(anyhow!("Unsupported Z80 header length {header_len}")),
+        };
+        let mode = cursor.read_u8()?;
+        machine = match (version, mode) {
+            (_, 0 | 1) | (3, 3) => ZXMachine::Sinclair48K,
+            (2, 3 | 4) | (3, 4..=6) | (_, 12) => ZXMachine::Sinclair128K,
+            _ => return Err(anyhow!("Unsupported Z80 hardware mode {mode} (version {version})")),
+        };
+        port_7ffd = cursor.read_u8()?;
+        let end = 32 + usize::from(header_len);
+        anyhow::ensure!(end <= z80_data.len(), "Truncated Z80 header");
+        cursor.set_position(end as u64);
     }
 
     // Prepare banks (for 128K support)
@@ -103,16 +95,17 @@ pub fn convert_z80_to_sna(z80_data: &[u8]) -> Result<(Vec<u8>, ZXMachine)> {
         
         let mut ram_48k = vec![0u8; 49152];
         if compressed {
-            decompress_z80_block(data_rem, &mut ram_48k)?;
+            decompress_z80_block(data_rem.strip_suffix(&[0, 0xed, 0xed, 0]).unwrap_or(data_rem), &mut ram_48k)?;
         } else {
-             let len = data_rem.len().min(49152);
-             ram_48k[0..len].copy_from_slice(&data_rem[0..len]);
+            anyhow::ensure!(data_rem.len() == 49152, "Expected 48K of snapshot RAM");
+            ram_48k.copy_from_slice(data_rem);
         }
         // Map 48k to banks 5, 2, 0
         banks[5].copy_from_slice(&ram_48k[0..16384]);
         banks[2].copy_from_slice(&ram_48k[16384..32768]);
         banks[0].copy_from_slice(&ram_48k[32768..49152]);
     } else {
+        let mut loaded = [false; 8];
         while cursor.position() < z80_data.len() as u64 {
              let len_low = cursor.read_u8()?;
              let len_high = cursor.read_u8()?;
@@ -121,12 +114,12 @@ pub fn convert_z80_to_sna(z80_data: &[u8]) -> Result<(Vec<u8>, ZXMachine)> {
              
              let data_start = cursor.position() as usize;
              let data_end = if block_len == 0xFFFF { data_start + 16384 } else { data_start + block_len as usize };
-             if data_end > z80_data.len() { break; }
+             anyhow::ensure!(data_end <= z80_data.len(), "Truncated Z80 RAM block");
              
              let chunk = &z80_data[data_start..data_end];
              cursor.set_position(data_end as u64);
 
-             let bank_idx = if hardware_mode <= 1 {
+             let bank_idx = if machine == ZXMachine::Sinclair48K {
                  match page {
                      8 => 5,
                      4 => 2,
@@ -140,12 +133,19 @@ pub fn convert_z80_to_sna(z80_data: &[u8]) -> Result<(Vec<u8>, ZXMachine)> {
                  }
              };
 
+             loaded[bank_idx] = true;
              if block_len == 0xFFFF {
                  banks[bank_idx].copy_from_slice(chunk);
              } else {
                  decompress_z80_block(chunk, &mut banks[bank_idx])?;
              }
         }
+        let complete = if machine == ZXMachine::Sinclair48K {
+            loaded[5] && loaded[2] && loaded[0]
+        } else {
+            loaded.iter().all(|present| *present)
+        };
+        anyhow::ensure!(complete, "Missing Z80 RAM pages");
     }
 
     // --- Build SNA ---
@@ -160,7 +160,7 @@ pub fn convert_z80_to_sna(z80_data: &[u8]) -> Result<(Vec<u8>, ZXMachine)> {
     sna.push(c);     sna.push(b);
     sna.push(iy_low); sna.push(iy_high);
     sna.push(ix_low); sna.push(ix_high);
-    sna.push((iff2 >> 2) & 1 | (1 << 1));
+    sna.push(if iff2 != 0 { 4 } else { 0 });
     sna.push(r_full);
     sna.push(f); sna.push(a);
     sna.push(sp_low); sna.push(sp_high);
@@ -175,13 +175,9 @@ pub fn convert_z80_to_sna(z80_data: &[u8]) -> Result<(Vec<u8>, ZXMachine)> {
         let new_sp = sp.wrapping_sub(2);
         sna[23] = (new_sp & 0xFF) as u8;
         sna[24] = (new_sp >> 8) as u8;
-        if new_sp >= 16384 {
-            let offset = 27 + (new_sp - 16384) as usize;
-            if offset + 1 < sna.len() {
-                sna[offset] = (pc_real & 0xFF) as u8;
-                sna[offset + 1] = (pc_real >> 8) as u8;
-            }
-        }
+        anyhow::ensure!((0x4000..=0xfffe).contains(&new_sp), "Snapshot stack cannot hold the 48K return address");
+        let offset = 27 + usize::from(new_sp - 0x4000);
+        sna[offset..offset + 2].copy_from_slice(&pc_real.to_le_bytes());
     } else {
         // 128K SNA
         let current_bank = (port_7ffd & 0x07) as usize;
@@ -210,27 +206,21 @@ fn decompress_z80_block(input: &[u8], output: &mut [u8]) -> Result<()> {
     let mut i = 0;
     let mut j = 0;
     
-    while i < input.len() && j < output.len() {
-        if i + 4 <= input.len() && input[i] == 0xED && input[i+1] == 0xED {
-            // Marker ED ED xx yy
-            let count = input[i+2] as usize;
-            let val = input[i+3];
+    while i < input.len() {
+        if input[i..].starts_with(&[0xed, 0xed]) {
+            anyhow::ensure!(input.len() - i >= 4, "Incomplete Z80 run");
+            let count = usize::from(input[i + 2]);
+            anyhow::ensure!(count != 0 && count <= output.len() - j, "Invalid Z80 run length");
+            output[j..j + count].fill(input[i + 3]);
             i += 4;
-            
-            for _ in 0..count {
-                if j < output.len() {
-                    output[j] = val;
-                    j += 1;
-                }
-            }
+            j += count;
         } else {
+            anyhow::ensure!(j < output.len(), "Excess Z80 RAM data");
             output[j] = input[i];
             j += 1;
             i += 1;
         }
-        
-        // v1 special marker: 00 ED ED 00 (End of file)
-        // But we just loop until processed.
     }
+    anyhow::ensure!(j == output.len(), "Incomplete Z80 RAM data");
     Ok(())
 }

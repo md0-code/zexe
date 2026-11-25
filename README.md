@@ -34,6 +34,8 @@ Run `python tools/package.py` from a clean checkout with Python 3 and Cargo. The
 
 To create a standalone game, you need the `zexe-bundler` and `zexe-runner` binaries (found in the `dist` folder after building).
 
+In an extracted release, run `./zexe-bundler` (Linux) or `.\zexe-bundler.exe` (Windows) directly from the extracted directory. The commands below use a source checkout.
+
 ### Creating a Standalone Executable
 
 Run the bundler with your game snapshot. The bundler will also automatically look for `.glsl`, `.pok`, and `.json` files with the same name as the input if you don't provide them explicitly.

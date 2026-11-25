@@ -122,4 +122,4 @@ A `config.json` can be embedded using the `--config` flag or placed in the same 
 
 ## License
 
-This project is licensed under the GPLv3 License - see [the license](docs/LICENSE) and [third-party notices](docs/THIRD_PARTY.md).
+This project is licensed under the GPLv3 License - see [the license](LICENSE) and [third-party notices](docs/THIRD_PARTY.md).

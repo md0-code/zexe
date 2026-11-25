@@ -57,6 +57,7 @@ def package():
         for binary in ("zexe-runner", "zexe-bundler"):
             shutil.copy2(ROOT / "build/release" / (binary + suffix), payload)
         shutil.copy2(ROOT / "README.md", payload)
+        shutil.copy2(ROOT / "LICENSE", payload)
         shutil.copytree(ROOT / "docs", payload / "docs",
                         ignore=shutil.ignore_patterns("DEVELOPMENT.md", "dev", "__pycache__"))
         dependency_notices(payload)
